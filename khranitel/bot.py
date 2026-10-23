@@ -1,4 +1,4 @@
-"""Телеграм-бот. Сказ в чате и в личке, версии историй, тест с «назад»."""
+"""Телеграм-бот. Сказ в чате/теме, версии историй, тест с «назад»."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from aiogram.types import FSInputFile, Message, PollAnswer
 
 from khranitel.engine import decide, roll_check, verdict
 from khranitel.format import Adventure, AdventureError, Choice, Scene, install_upload
-from khranitel import phrases, state, tales
+from khranitel import phrases, state, tales, timing
 
 ROOT = Path(__file__).resolve().parents[1]
 ADVENTURES = ROOT / "adventures"
@@ -49,6 +49,27 @@ def _is_private(message: Message) -> bool:
 
 def _is_group(message: Message) -> bool:
     return message.chat.type in {"group", "supergroup"}
+
+
+def _thread_id(message: Message) -> int | None:
+    """Тема форума, если команда пришла из топика; иначе None."""
+    return message.message_thread_id
+
+
+def _thread_kw(thread_id: int | None) -> dict:
+    return {"message_thread_id": thread_id} if thread_id is not None else {}
+
+
+async def _say(bot: Bot, chat_id: int, text: str, *, thread_id: int | None) -> None:
+    await bot.send_message(chat_id, text, **_thread_kw(thread_id))
+
+
+async def _expect_voters(bot: Bot, chat_id: int) -> int:
+    try:
+        total = await bot.get_chat_member_count(chat_id)
+    except Exception:
+        return 1
+    return timing.expect_voters_from_member_count(total)
 
 
 def _load_env() -> None:
@@ -124,27 +145,33 @@ async def begin_command(message: Message, command: CommandObject) -> None:
     if _is_group(message) and not _is_admin(message):
         await _deny(message)
         return
+    thread_id = _thread_id(message)
     slug = (command.args or "").strip()
     async with _lock:
         data = state.load(STATE_PATH)
-        if state.session(data, message.chat.id):
-            await message.answer("В этом чате уже идёт сказ. /stop — оборвать.")
+        if state.session(data, message.chat.id, thread_id):
+            await message.answer("Здесь уже идёт сказ. /stop — оборвать.")
             return
     if slug:
-        await _start_tale(message.bot, message.chat.id, slug, instant=_is_private(message))
+        await _start_tale(
+            message.bot, message.chat.id, slug,
+            instant=_is_private(message), thread_id=thread_id)
         return
-    await _open_begin_vote(message.bot, message.chat.id, instant=_is_private(message))
+    await _open_begin_vote(
+        message.bot, message.chat.id,
+        instant=_is_private(message), thread_id=thread_id)
 
 
 @router.message(Command("retell"))
 async def retell_command(message: Message) -> None:
     await _maybe_welcome(message)
+    thread_id = _thread_id(message)
     async with _lock:
         data = state.load(STATE_PATH)
-        if state.session(data, message.chat.id):
+        if state.session(data, message.chat.id, thread_id):
             await message.answer("Сначала дослушайте или /stop — иначе два сказа сразу.")
             return
-        finished = state.last_finished(data, message.chat.id)
+        finished = state.last_finished(data, message.chat.id, thread_id)
     if not finished:
         await message.answer("Ещё нечего пересказывать — ни одна история здесь не закончилась.")
         return
@@ -155,30 +182,38 @@ async def retell_command(message: Message) -> None:
         variant=finished.get("variant"),
         instant=_is_private(message) or bool(finished.get("test")),
         test=bool(finished.get("test")),
+        thread_id=thread_id,
     )
 
 
 @router.message(Command("status"))
 async def status_command(message: Message) -> None:
     await _maybe_welcome(message)
+    thread_id = _thread_id(message)
     data = state.load(STATE_PATH)
-    current = state.session(data, message.chat.id)
+    current = state.session(data, message.chat.id, thread_id)
     if not current:
-        await message.answer("В этом чате сказ не идёт.")
+        await message.answer("Здесь сказ не идёт.")
         return
     kind = current.get("kind", "scene")
+    voted = len(current.get("voters") or [])
+    expect = int(current.get("expect_voters") or 0)
+    vote_tail = ""
+    if expect and not current.get("instant"):
+        vote_tail = f" Голосов {voted}/{expect}."
     if kind == "begin":
         left = max(0, int(current["deadline"] - time.time()))
         minutes, seconds = divmod(left, 60)
         await message.answer(
-            f"Выбираем историю. До конца голосования {minutes} мин. {seconds} сек.")
+            f"Выбираем историю. До конца голосования {minutes} мин. {seconds} сек."
+            f"{vote_tail}")
         return
     if kind == "spoiler":
         left = max(0, int(current["deadline"] - time.time()))
         minutes, seconds = divmod(left, 60)
         await message.answer(
             f"Голосуем за другую версию «{current.get('tale_title', current.get('title', ''))}». "
-            f"Осталось {minutes} мин. {seconds} сек.")
+            f"Осталось {minutes} мин. {seconds} сек.{vote_tail}")
         return
     title = current.get("title", "?")
     node = current.get("node", "?")
@@ -189,7 +224,7 @@ async def status_command(message: Message) -> None:
     minutes, seconds = divmod(left, 60)
     await message.answer(
         f"«{title}», сцена {node}. "
-        f"До конца голосования {minutes} мин. {seconds} сек.")
+        f"До конца голосования {minutes} мин. {seconds} сек.{vote_tail}")
 
 
 @router.message(Command("stop"))
@@ -198,11 +233,12 @@ async def stop_command(message: Message) -> None:
     if _is_group(message) and not _is_admin(message):
         await _deny(message)
         return
+    thread_id = _thread_id(message)
     async with _lock:
         data = state.load(STATE_PATH)
-        current = state.session(data, message.chat.id)
+        current = state.session(data, message.chat.id, thread_id)
         if current:
-            state.put(data, message.chat.id, None)
+            state.put(data, message.chat.id, None, thread_id)
             state.save(STATE_PATH, data)
     if not current:
         await message.answer("Останавливать нечего — и так тихо.")
@@ -214,10 +250,11 @@ async def stop_command(message: Message) -> None:
 async def spoiler_command(message: Message) -> None:
     if not _is_group(message):
         return
+    thread_id = _thread_id(message)
     async with _lock:
         data = state.load(STATE_PATH)
-        current = state.session(data, message.chat.id)
-        finished = state.last_finished(data, message.chat.id)
+        current = state.session(data, message.chat.id, thread_id)
+        finished = state.last_finished(data, message.chat.id, thread_id)
     tale_slug = None
     variant = None
     if current and current.get("kind") == "scene":
@@ -241,7 +278,7 @@ async def spoiler_command(message: Message) -> None:
     if current:
         async with _lock:
             data = state.load(STATE_PATH)
-            state.put(data, message.chat.id, None)
+            state.put(data, message.chat.id, None, thread_id)
             state.save(STATE_PATH, data)
     labels = []
     nexts = []
@@ -254,27 +291,32 @@ async def spoiler_command(message: Message) -> None:
         nexts.append(vid)
     labels.append("Оставить как есть")
     nexts.append("__keep__")
-    prompt = phrases.spoiler_prompt(tale.title)
-    await message.answer(prompt)
+    await message.answer(phrases.spoiler_prompt(tale.title))
+    expect = await _expect_voters(message.bot, message.chat.id)
+    wait = timing.vote_wait_seconds(expect, SPOILER_VOTE_MINUTES)
     poll = await message.bot.send_poll(
-        message.chat.id, "Другая версия?", labels, is_anonymous=True)
+        message.chat.id, "Другая версия?", labels,
+        is_anonymous=False, **_thread_kw(thread_id))
     async with _lock:
         data = state.load(STATE_PATH)
         state.put(data, message.chat.id, {
             "kind": "spoiler",
             "instant": False,
             "test": False,
+            "thread_id": thread_id,
             "tale": tale.slug,
             "variant": variant,
             "tale_title": tale.title,
             "title": tale.title,
             "message_id": poll.message_id,
             "poll_id": poll.poll.id if poll.poll else "",
-            "deadline": time.time() + SPOILER_VOTE_MINUTES * 60,
+            "deadline": time.time() + wait,
             "labels": labels,
             "next": nexts,
             "path": [],
-        })
+            "expect_voters": expect,
+            "voters": [],
+        }, thread_id)
         state.save(STATE_PATH, data)
 
 
@@ -298,7 +340,8 @@ async def test_command(message: Message, command: CommandObject) -> None:
     await message.answer(
         "Тестовый режим. Дальше /begin — сказ с пунктом «назад» в опросах, "
         "ответ сразу после голоса. Здесь же видны скрытые скиллчеки сцен.")
-    await _open_begin_vote(message.bot, message.chat.id, instant=True, test=True)
+    await _open_begin_vote(
+        message.bot, message.chat.id, instant=True, test=True, thread_id=None)
 
 
 @router.message(F.document)
@@ -344,24 +387,42 @@ async def private_fallback(message: Message) -> None:
 
 @router.poll_answer()
 async def on_poll_answer(answer: PollAnswer, bot: Bot) -> None:
-    """Мгновенный режим: первый голос закрывает опрос."""
+    """Мгновенный режим или досрочное закрытие, когда проголосовали все."""
     poll_id = answer.poll_id
     async with _lock:
         data = state.load(STATE_PATH)
-        found = None
-        for key, current in data["chats"].items():
-            if isinstance(current, dict) and current.get("poll_id") == poll_id:
-                found = (int(key), current)
-                break
+        found = state.find_by_poll(data, poll_id)
         if found is None:
             return
-        chat_id, current = found
-        if not current.get("instant"):
-            return
-        # забираем сессию, чтобы второй голос не обработался
-        state.put(data, chat_id, None)
-        state.save(STATE_PATH, data)
-    await _finish(bot, chat_id, current, prefetched_option=answer.option_ids)
+        _key, chat_id, thread_id, current = found
+        if current.get("instant"):
+            state.put(data, chat_id, None, thread_id)
+            state.save(STATE_PATH, data)
+            finish_now = True
+            prefetched = answer.option_ids
+        else:
+            voters = {int(v) for v in current.get("voters") or []}
+            user = answer.user
+            if user is not None:
+                if answer.option_ids:
+                    voters.add(user.id)
+                else:
+                    voters.discard(user.id)
+            current["voters"] = sorted(voters)
+            state.put(data, chat_id, current, thread_id)
+            expect = int(current.get("expect_voters") or 0)
+            finish_now = expect > 0 and len(voters) >= expect
+            if finish_now:
+                state.put(data, chat_id, None, thread_id)
+            state.save(STATE_PATH, data)
+            prefetched = None
+    if not finish_now:
+        return
+    await _finish(
+        bot, chat_id, current,
+        thread_id=thread_id,
+        prefetched_option=prefetched,
+    )
 
 
 def _slug(filename: str) -> str:
@@ -371,60 +432,72 @@ def _slug(filename: str) -> str:
 
 
 async def _open_begin_vote(
-    bot: Bot, chat_id: int, *, instant: bool, test: bool = False,
+    bot: Bot,
+    chat_id: int,
+    *,
+    instant: bool,
+    test: bool = False,
+    thread_id: int | None = None,
 ) -> None:
     catalog = tales.discover_tales(ADVENTURES)
     if not catalog:
-        await bot.send_message(chat_id, "Историй нет. Сказитель ещё не положил свитки.")
+        await _say(bot, chat_id, "Историй нет. Сказитель ещё не положил свитки.",
+                   thread_id=thread_id)
         return
     async with _lock:
         data = state.load(STATE_PATH)
-        cool = state.chat_cooldowns(data, chat_id)
-        # tick после предыдущего begin — кулдаун «на это и следующее»
-        # уменьшаем при открытии нового голосования begin
+        cool = state.chat_cooldowns(data, chat_id, thread_id)
         candidates = tales.pick_candidates(catalog, cool)
         state.save(STATE_PATH, data)
     if not candidates:
-        await bot.send_message(chat_id, "Не из чего выбирать.")
+        await _say(bot, chat_id, "Не из чего выбирать.", thread_id=thread_id)
         return
     if len(candidates) == 1:
         only = candidates[0]
         async with _lock:
             data = state.load(STATE_PATH)
-            cool = state.chat_cooldowns(data, chat_id)
+            cool = state.chat_cooldowns(data, chat_id, thread_id)
             tales.tick_cooldowns(cool)
             state.save(STATE_PATH, data)
-        await bot.send_message(
-            chat_id, f"На кону одна история — «{only.title}». Иного свитка нет.")
-        await _start_tale(bot, chat_id, only.slug, instant=instant, test=test)
+        await _say(
+            bot, chat_id,
+            f"На кону одна история — «{only.title}». Иного свитка нет.",
+            thread_id=thread_id)
+        await _start_tale(
+            bot, chat_id, only.slug, instant=instant, test=test, thread_id=thread_id)
         return
     labels = [f"{tale.title}"[:100] for tale in candidates]
     nexts = [tale.slug for tale in candidates]
-    await bot.send_message(chat_id, phrases.begin_prompt())
+    await _say(bot, chat_id, phrases.begin_prompt(), thread_id=thread_id)
+    expect = 1 if instant else await _expect_voters(bot, chat_id)
+    wait = (
+        INSTANT_DEADLINE_PAD if instant
+        else timing.vote_wait_seconds(expect, BEGIN_VOTE_MINUTES))
     poll = await bot.send_poll(
         chat_id,
         "Какую историю слушаем?",
         labels,
-        is_anonymous=not instant,
+        is_anonymous=False,
+        **_thread_kw(thread_id),
     )
-    deadline = (
-        time.time() + INSTANT_DEADLINE_PAD if instant
-        else time.time() + BEGIN_VOTE_MINUTES * 60)
     async with _lock:
         data = state.load(STATE_PATH)
-        cool = state.chat_cooldowns(data, chat_id)
+        cool = state.chat_cooldowns(data, chat_id, thread_id)
         tales.tick_cooldowns(cool)
         state.put(data, chat_id, {
             "kind": "begin",
             "instant": instant,
             "test": test,
+            "thread_id": thread_id,
             "message_id": poll.message_id,
             "poll_id": poll.poll.id if poll.poll else "",
-            "deadline": deadline,
+            "deadline": time.time() + wait,
             "labels": labels,
             "next": nexts,
             "path": [],
-        })
+            "expect_voters": expect,
+            "voters": [],
+        }, thread_id)
         state.save(STATE_PATH, data)
 
 
@@ -436,21 +509,23 @@ async def _start_tale(
     variant: str | None = None,
     instant: bool = False,
     test: bool = False,
+    thread_id: int | None = None,
 ) -> None:
     tale = tales.tale_by_slug(ADVENTURES, tale_slug)
     if tale is None:
-        await bot.send_message(chat_id, f"Истории «{tale_slug}» нет.")
+        await _say(bot, chat_id, f"Истории «{tale_slug}» нет.", thread_id=thread_id)
         return
     try:
         variant_id = variant if variant in tale.variants else tales.pick_variant(tale)
         adventure = tale.load(variant_id)
     except AdventureError as error:
-        await bot.send_message(chat_id, "Не запускаю:\n" + "\n".join(error.errors))
+        await _say(bot, chat_id, "Не запускаю:\n" + "\n".join(error.errors),
+                   thread_id=thread_id)
         return
     except KeyError:
-        await bot.send_message(chat_id, "Версия истории не найдена.")
+        await _say(bot, chat_id, "Версия истории не найдена.", thread_id=thread_id)
         return
-    await bot.send_message(chat_id, phrases.start_line(adventure.title))
+    await _say(bot, chat_id, phrases.start_line(adventure.title), thread_id=thread_id)
     await _enter(
         bot, chat_id, adventure,
         adventure.start,
@@ -459,6 +534,7 @@ async def _start_tale(
         instant=instant,
         test=test,
         path=[],
+        thread_id=thread_id,
     )
 
 
@@ -473,14 +549,16 @@ async def _enter(
     instant: bool,
     test: bool,
     path: list[str],
+    thread_id: int | None,
     chain: set[str] | None = None,
 ) -> None:
     chain = set() if chain is None else chain
     if scene_id in chain:
-        await bot.send_message(chat_id, "Сценарий зациклился без выбора. Останавливаюсь.")
+        await _say(bot, chat_id, "Сценарий зациклился без выбора. Останавливаюсь.",
+                   thread_id=thread_id)
         return
     scene = adventure.scene(scene_id)
-    await _show_scene(bot, chat_id, adventure, scene, scene.text)
+    await _show_scene(bot, chat_id, adventure, scene, scene.text, thread_id=thread_id)
     choices = list(scene.choices)
     if len(choices) >= 2 or (test and path and len(choices) >= 1):
         await _open_scene_poll(
@@ -490,19 +568,22 @@ async def _enter(
             instant=instant,
             test=test,
             path=path,
+            thread_id=thread_id,
         )
         return
     if len(choices) == 1 and not (test and path):
         only = choices[0]
-        await bot.send_message(chat_id, f"Другого пути нет: «{only.label}».")
+        await _say(bot, chat_id, f"Другого пути нет: «{only.label}».", thread_id=thread_id)
         dest = only.next
         if only.is_check:
             dest, outcome, detail = roll_check(
                 only.chance_min, only.chance_max,
                 success=only.next, fail=only.fail)
             if test:
-                await bot.send_message(
-                    chat_id, phrases.skillcheck_admin_roll(only.label, outcome, detail))
+                await _say(
+                    bot, chat_id,
+                    phrases.skillcheck_admin_roll(only.label, outcome, detail),
+                    thread_id=thread_id)
         chain.add(scene_id)
         await _enter(
             bot, chat_id, adventure, dest,
@@ -511,11 +592,11 @@ async def _enter(
             instant=instant,
             test=test,
             path=path + [scene_id],
+            thread_id=thread_id,
             chain=chain,
         )
         return
     if test and path and len(choices) == 0:
-        # финал в тесте — всё же дать «назад»
         await _open_scene_poll(
             bot, chat_id, adventure, scene,
             tale_slug=tale_slug,
@@ -523,9 +604,12 @@ async def _enter(
             instant=instant,
             test=test,
             path=path,
+            thread_id=thread_id,
         )
         return
-    await _finish_story(bot, chat_id, adventure, tale_slug, variant_id, test=test)
+    await _finish_story(
+        bot, chat_id, adventure, tale_slug, variant_id,
+        test=test, thread_id=thread_id)
 
 
 async def _finish_story(
@@ -536,33 +620,43 @@ async def _finish_story(
     variant_id: str,
     *,
     test: bool,
+    thread_id: int | None,
 ) -> None:
     async with _lock:
         data = state.load(STATE_PATH)
-        state.put(data, chat_id, None)
-        cool = state.chat_cooldowns(data, chat_id)
+        state.put(data, chat_id, None, thread_id)
+        cool = state.chat_cooldowns(data, chat_id, thread_id)
         tales.mark_played(cool, tale_slug)
         state.set_last_finished(data, chat_id, {
             "tale": tale_slug,
             "variant": variant_id,
             "title": adventure.title,
             "test": test,
-        })
+        }, thread_id)
         state.save(STATE_PATH, data)
-    await bot.send_message(chat_id, phrases.end_line(adventure.title))
+    await _say(bot, chat_id, phrases.end_line(adventure.title), thread_id=thread_id)
 
 
-async def _show_scene(bot: Bot, chat_id: int, adventure: Adventure, scene: Scene, text: str) -> None:
+async def _show_scene(
+    bot: Bot,
+    chat_id: int,
+    adventure: Adventure,
+    scene: Scene,
+    text: str,
+    *,
+    thread_id: int | None,
+) -> None:
     picture = adventure.image_path(scene)
+    kw = _thread_kw(thread_id)
     if picture is None:
-        await bot.send_message(chat_id, text)
+        await bot.send_message(chat_id, text, **kw)
         return
     photo = FSInputFile(picture)
     if len(text) <= 1024:
-        await bot.send_photo(chat_id, photo, caption=text)
+        await bot.send_photo(chat_id, photo, caption=text, **kw)
         return
-    await bot.send_photo(chat_id, photo)
-    await bot.send_message(chat_id, text)
+    await bot.send_photo(chat_id, photo, **kw)
+    await bot.send_message(chat_id, text, **kw)
 
 
 def _check_payload(choice: Choice) -> dict | None:
@@ -587,6 +681,7 @@ async def _open_scene_poll(
     instant: bool,
     test: bool,
     path: list[str],
+    thread_id: int | None,
 ) -> None:
     labels = [choice.label for choice in scene.choices]
     nexts = [choice.next for choice in scene.choices]
@@ -596,9 +691,8 @@ async def _open_scene_poll(
         nexts = nexts + [BACK_NEXT]
         checks = checks + [None]
     if len(labels) < 2:
-        # только «назад» на финале теста — всё равно опрос из одного пункта недопустим
         if labels:
-            await bot.send_message(chat_id, f"Можно только: «{labels[0]}».")
+            await _say(bot, chat_id, f"Можно только: «{labels[0]}».", thread_id=thread_id)
             if nexts[0] == BACK_NEXT:
                 prev = path[-1]
                 await _enter(
@@ -608,9 +702,12 @@ async def _open_scene_poll(
                     instant=instant,
                     test=test,
                     path=path[:-1],
+                    thread_id=thread_id,
                 )
             return
-        await _finish_story(bot, chat_id, adventure, tale_slug, variant_id, test=test)
+        await _finish_story(
+            bot, chat_id, adventure, tale_slug, variant_id,
+            test=test, thread_id=thread_id)
         return
     if test:
         hint_lines = []
@@ -621,19 +718,24 @@ async def _open_scene_poll(
                 f"«{choice.label}» — шанс {choice.chance_min}–{choice.chance_max}% "
                 f"→ {choice.next} / провал → {choice.fail}")
         if hint_lines:
-            await bot.send_message(
-                chat_id, phrases.skillcheck_admin_hint(scene.id, hint_lines))
+            await _say(
+                bot, chat_id,
+                phrases.skillcheck_admin_hint(scene.id, hint_lines),
+                thread_id=thread_id)
+    expect = 1 if instant else await _expect_voters(bot, chat_id)
+    wait = (
+        INSTANT_DEADLINE_PAD if instant
+        else timing.vote_wait_seconds(expect, adventure.vote_minutes))
     poll = await bot.send_poll(
-        chat_id, POLL_QUESTION, labels, is_anonymous=not instant)
-    deadline = (
-        time.time() + INSTANT_DEADLINE_PAD if instant
-        else time.time() + adventure.vote_minutes * 60)
+        chat_id, POLL_QUESTION, labels,
+        is_anonymous=False, **_thread_kw(thread_id))
     async with _lock:
         data = state.load(STATE_PATH)
         state.put(data, chat_id, {
             "kind": "scene",
             "instant": instant,
             "test": test,
+            "thread_id": thread_id,
             "tale": tale_slug,
             "variant": variant_id,
             "adventure": adventure.slug,
@@ -641,12 +743,14 @@ async def _open_scene_poll(
             "node": scene.id,
             "message_id": poll.message_id,
             "poll_id": poll.poll.id if poll.poll else "",
-            "deadline": deadline,
+            "deadline": time.time() + wait,
             "labels": labels,
             "next": nexts,
             "checks": checks,
             "path": list(path),
-        })
+            "expect_voters": expect,
+            "voters": [],
+        }, thread_id)
         state.save(STATE_PATH, data)
 
 
@@ -662,12 +766,13 @@ async def close_due(bot: Bot) -> None:
             if current.get("instant"):
                 continue
             if now >= float(current.get("deadline", 0)):
-                due.append((int(key), current))
-                state.put(data, int(key), None)
+                chat_id, thread_id = state.parse_scope_key(key)
+                due.append((chat_id, thread_id, current))
+                state.put(data, chat_id, None, thread_id)
         if due:
             state.save(STATE_PATH, data)
-    for chat_id, current in due:
-        await _finish(bot, chat_id, current)
+    for chat_id, thread_id, current in due:
+        await _finish(bot, chat_id, current, thread_id=thread_id)
 
 
 async def _finish(
@@ -675,12 +780,14 @@ async def _finish(
     chat_id: int,
     current: dict,
     *,
+    thread_id: int | None = None,
     prefetched_option: list[int] | None = None,
 ) -> None:
+    if thread_id is None and current.get("thread_id") is not None:
+        thread_id = current.get("thread_id")
     kind = current.get("kind", "scene")
     try:
         if prefetched_option is not None:
-            # мгновенный режим: голос уже известен, опрос закрываем для порядка
             try:
                 await bot.stop_poll(chat_id, int(current["message_id"]))
             except Exception:
@@ -691,7 +798,8 @@ async def _finish(
                 index = int(prefetched_option[0])
             labels = list(current["labels"])
             if index < 0 or index >= len(labels):
-                await bot.send_message(chat_id, "Голос не из этого опроса. Сказ остановлен.")
+                await _say(bot, chat_id, "Голос не из этого опроса. Сказ остановлен.",
+                           thread_id=thread_id)
                 return
             counts = [0] * len(labels)
             counts[index] = 1
@@ -700,14 +808,15 @@ async def _finish(
             counts = [option.voter_count for option in closed.options]
             labels = list(current["labels"])
             if len(counts) != len(labels):
-                await bot.send_message(chat_id, "Опрос не совпал со сценарием. Сказ остановлен.")
+                await _say(bot, chat_id, "Опрос не совпал со сценарием. Сказ остановлен.",
+                           thread_id=thread_id)
                 return
             index, _reason = decide(counts)
             if not current.get("instant"):
-                await bot.send_message(chat_id, verdict(labels, counts))
+                await _say(bot, chat_id, verdict(labels, counts), thread_id=thread_id)
     except Exception:
-        await bot.send_message(
-            chat_id, "Не удалось закрыть голосование. Сказ остановлен.")
+        await _say(bot, chat_id, "Не удалось закрыть голосование. Сказ остановлен.",
+                   thread_id=thread_id)
         return
 
     chosen = current["next"][index]
@@ -717,22 +826,26 @@ async def _finish(
             bot, chat_id, chosen,
             instant=bool(current.get("instant")),
             test=bool(current.get("test")),
+            thread_id=thread_id,
         )
         return
 
     if kind == "spoiler":
         if chosen == "__keep__":
-            await bot.send_message(chat_id, "Оставляем текущую версию. Спойлеры — ваша ноша.")
+            await _say(
+                bot, chat_id,
+                "Оставляем текущую версию. Спойлеры — ваша ноша.",
+                thread_id=thread_id)
             return
         await _start_tale(
             bot, chat_id, current["tale"],
             variant=chosen,
             instant=False,
             test=False,
+            thread_id=thread_id,
         )
         return
 
-    # scene
     tale_slug = current["tale"]
     variant_id = current["variant"]
     path = list(current.get("path") or [])
@@ -746,12 +859,12 @@ async def _finish(
     except AdventureError as error:
         details = getattr(error, "errors", None)
         text = "\n".join(details) if details else str(error)
-        await bot.send_message(chat_id, text)
+        await _say(bot, chat_id, text, thread_id=thread_id)
         return
 
     if chosen == BACK_NEXT:
         if not path:
-            await bot.send_message(chat_id, "Назад уже некуда.")
+            await _say(bot, chat_id, "Назад уже некуда.", thread_id=thread_id)
             return
         prev = path[-1]
         await _enter(
@@ -761,6 +874,7 @@ async def _finish(
             instant=instant,
             test=test,
             path=path[:-1],
+            thread_id=thread_id,
         )
         return
 
@@ -776,8 +890,10 @@ async def _finish(
         )
         if test:
             label = labels[index] if index < len(labels) else chosen
-            await bot.send_message(
-                chat_id, phrases.skillcheck_admin_roll(label, outcome, detail))
+            await _say(
+                bot, chat_id,
+                phrases.skillcheck_admin_roll(label, outcome, detail),
+                thread_id=thread_id)
 
     node = current["node"]
     await _enter(
@@ -787,6 +903,7 @@ async def _finish(
         instant=instant,
         test=test,
         path=path + [node],
+        thread_id=thread_id,
     )
 
 
