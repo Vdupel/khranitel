@@ -1,4 +1,9 @@
-"""Чистое решение по итогам опроса. Сеть сюда не входит."""
+"""Чистое решение по итогам опроса и скиллчеков. Сеть сюда не входит."""
+
+from __future__ import annotations
+
+import random
+from typing import Any
 
 
 def decide(counts: list[int]) -> tuple[int, str]:
@@ -32,6 +37,43 @@ def verdict(labels: list[str], counts: list[int]) -> str:
                 f"Берём тот, что раньше в сценарии: «{label}».")
     word = _votes(votes)
     return f"Большинство выбрало «{label}» — {votes} {word}."
+
+
+def roll_check(
+    chance_min: int,
+    chance_max: int,
+    *,
+    success: str,
+    fail: str,
+    rng: random.Random | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Бросок скиллчека.
+
+    Сначала из диапазона берётся свежий порог успеха (не константа),
+    затем d100. Возвращает (сцена, 'success'|'fail', детали для админа).
+    """
+    if chance_min >= chance_max:
+        raise ValueError("шанс должен быть диапазоном, не константой")
+    if success == fail:
+        raise ValueError("успех и провал не могут вести в одну сцену")
+    rng = rng or random.Random()
+    threshold = rng.randint(chance_min, chance_max)
+    roll = rng.randint(1, 100)
+    if roll <= threshold:
+        return success, "success", {
+            "threshold": threshold,
+            "roll": roll,
+            "chance_min": chance_min,
+            "chance_max": chance_max,
+            "dest": success,
+        }
+    return fail, "fail", {
+        "threshold": threshold,
+        "roll": roll,
+        "chance_min": chance_min,
+        "chance_max": chance_max,
+        "dest": fail,
+    }
 
 
 def _votes(count: int) -> str:

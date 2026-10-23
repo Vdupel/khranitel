@@ -8,6 +8,8 @@
 В yaml: название, сколько минут длится голосование, id стартовой сцены
 и словарь сцен. У сцены — текст, необязательная картинка и варианты.
 Вариант — подпись на кнопке голосования и id следующей сцены.
+Скиллчек: chance: [min, max] (проценты, min < max) и fail — сцена при провале;
+next — при успехе. Пути обязаны различаться. Игрокам не светится; в /test — да.
 Пустой список вариантов — конец. Один вариант — бот идёт туда без голосования.
 Два и больше — опрос в чате.
 
@@ -40,8 +42,23 @@ class AdventureError(Exception):
 
 @dataclass(frozen=True)
 class Choice:
+    """Вариант опроса.
+
+    Обычный: только ``next``.
+    Скиллчек: ``chance`` — диапазон шанса успеха в процентах ``[min, max]``
+    (каждый раз берётся свежий порог внутри диапазона), ``next`` — успех,
+    ``fail`` — провал. Успех и провал обязаны вести в разные сцены.
+    """
+
     label: str
     next: str
+    fail: str | None = None
+    chance_min: int | None = None
+    chance_max: int | None = None
+
+    @property
+    def is_check(self) -> bool:
+        return self.chance_min is not None
 
 
 @dataclass(frozen=True)
@@ -124,6 +141,19 @@ def parse_adventure(raw, *, slug: str, root: Path) -> Adventure:
                 errors.append(
                     f"Сцена «{scene.id}»: вариант «{choice.label}» ведёт "
                     f"в несуществующую сцену «{choice.next}»")
+            if choice.is_check:
+                if choice.fail is None:
+                    errors.append(
+                        f"Сцена «{scene.id}»: у «{choice.label}» есть chance, "
+                        f"но нет fail")
+                elif choice.fail not in scenes:
+                    errors.append(
+                        f"Сцена «{scene.id}»: вариант «{choice.label}» "
+                        f"при провале ведёт в несуществующую «{choice.fail}»")
+                elif choice.fail == choice.next:
+                    errors.append(
+                        f"Сцена «{scene.id}»: у «{choice.label}» успех и провал "
+                        f"ведут в одну сцену — шанс не должен быть постоянным путём")
 
     if errors:
         raise AdventureError(errors)
@@ -270,9 +300,48 @@ def _choice(scene_id: str, index: int, item, errors: list[str]) -> Choice | None
         if len(label) > LABEL_LIMIT:
             errors.append(f"{where}: подпись длиннее {LABEL_LIMIT} знаков")
     nxt = _ident(item.get("next"), f"{where}, next", errors)
+    fail = None
+    chance_min = None
+    chance_max = None
+    if "chance" in item or "fail" in item:
+        chance_min, chance_max = _chance_range(item.get("chance"), where, errors)
+        if "fail" not in item:
+            errors.append(f"{where}: при chance нужен fail — другая сцена при провале")
+        else:
+            fail = _ident(item.get("fail"), f"{where}, fail", errors)
+        if chance_min is None:
+            # ошибка уже записана; не собираем Choice с дырявым чеком
+            pass
     if not label or nxt is None:
         return None
-    return Choice(label, nxt)
+    if ("chance" in item or "fail" in item) and (
+            chance_min is None or chance_max is None or fail is None):
+        return None
+    return Choice(label, nxt, fail=fail, chance_min=chance_min, chance_max=chance_max)
+
+
+def _chance_range(value, where: str, errors: list[str]) -> tuple[int | None, int | None]:
+    """Диапазон процентов успеха. Не константа: min < max, оба в 1..99."""
+    if not isinstance(value, list) or len(value) != 2:
+        errors.append(
+            f"{where}: chance — список из двух целых [min, max], шанс не константа")
+        return None, None
+    low, high = value
+    if isinstance(low, bool) or isinstance(high, bool):
+        errors.append(f"{where}: chance — целые проценты, не bool")
+        return None, None
+    if not isinstance(low, int) or not isinstance(high, int):
+        errors.append(f"{where}: chance — два целых процента")
+        return None, None
+    if not (1 <= low <= 99 and 1 <= high <= 99):
+        errors.append(f"{where}: chance — проценты от 1 до 99")
+        return None, None
+    if low >= high:
+        errors.append(
+            f"{where}: chance — min должен быть меньше max "
+            f"(шанс не бывает постоянным числом)")
+        return None, None
+    return low, high
 
 
 def _text(value, field: str, errors: list[str]) -> str | None:
