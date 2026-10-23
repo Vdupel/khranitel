@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile, Message, PollAnswer
 
@@ -39,8 +40,12 @@ def _admins() -> set[int]:
 
 
 def _is_admin(message: Message) -> bool:
+    """Пустой ADMIN_IDS — команды доступны всем. Для запуска достаточно токена."""
+    admins = _admins()
+    if not admins:
+        return True
     user = message.from_user
-    return user is not None and user.id in _admins()
+    return user is not None and user.id in admins
 
 
 def _is_private(message: Message) -> bool:
@@ -938,17 +943,30 @@ async def _watch(bot: Bot) -> None:
 async def main() -> None:
     _load_env()
     log = techlog.setup()
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
     if not token:
-        raise SystemExit("В .env нет TELEGRAM_BOT_TOKEN")
-    if not _admins():
-        raise SystemExit("В .env нет ADMIN_IDS")
+        print("В .env нет токена. Запустите ещё раз и вставьте токен.", flush=True)
+        raise SystemExit(2)
     data = state.load(STATE_PATH)
     admin_token = state.ensure_admin_token(data, os.environ.get("ADMIN_TOKEN"))
     state.save(STATE_PATH, data)
     log.info("bot start; admin token ready")
     print(f"Админ-токен (/admin и /test): {admin_token}", flush=True)
     bot = Bot(token)
+    try:
+        me = await bot.get_me()
+    except TelegramUnauthorizedError:
+        await bot.session.close()
+        print("Токен не подошёл. Телеграм его не признал.", flush=True)
+        print("В Телеграме откройте @BotFather, отправьте /mybots,", flush=True)
+        print("выберите бота и нажмите API Token. Скопируйте токен заново.", flush=True)
+        raise SystemExit(2)
+    if _admins():
+        who = "команды только у ведущих из ADMIN_IDS"
+    else:
+        who = "ведущий не задан, команды доступны всем в чате"
+    print(f"Бот @{me.username} запущен. {who}.", flush=True)
+    print("Окно не закрывать. Остановить — закрыть это окно.", flush=True)
     dp = Dispatcher()
     dp.include_router(admin.router)
     dp.include_router(router)

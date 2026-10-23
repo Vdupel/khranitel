@@ -30,9 +30,9 @@ def run() -> None:
         if code == RESTART_EXIT_CODE:
             log.info("watchdog: child asked restart (%s)", code)
             continue
-        if code == 0:
-            log.info("watchdog: child exited cleanly — stop")
-            return
+        if code in (0, 2):
+            log.info("watchdog: child exited %s — stop", code)
+            raise SystemExit(code)
         log.error("watchdog: child crashed with code %s — sleep %ss", code, CRASH_SLEEP_SEC)
         time.sleep(CRASH_SLEEP_SEC)
 
