@@ -14,7 +14,7 @@ from aiogram.types import FSInputFile, Message, PollAnswer
 
 from khranitel.engine import decide, roll_check, verdict
 from khranitel.format import Adventure, AdventureError, Choice, Scene, install_upload
-from khranitel import phrases, state, tales, timing
+from khranitel import admin, phrases, state, stats, tales, techlog, timing
 
 ROOT = Path(__file__).resolve().parents[1]
 ADVENTURES = ROOT / "adventures"
@@ -584,6 +584,11 @@ async def _enter(
                     bot, chat_id,
                     phrases.skillcheck_admin_roll(only.label, outcome, detail),
                     thread_id=thread_id)
+        if not test:
+            try:
+                stats.record_choice(tale_slug, variant_id, scene_id, only.label)
+            except Exception:
+                techlog.get().exception("stats record_choice failed")
         chain.add(scene_id)
         await _enter(
             bot, chat_id, adventure, dest,
@@ -609,6 +614,7 @@ async def _enter(
         return
     await _finish_story(
         bot, chat_id, adventure, tale_slug, variant_id,
+        ending_scene=scene_id,
         test=test, thread_id=thread_id)
 
 
@@ -619,6 +625,7 @@ async def _finish_story(
     tale_slug: str,
     variant_id: str,
     *,
+    ending_scene: str,
     test: bool,
     thread_id: int | None,
 ) -> None:
@@ -634,6 +641,11 @@ async def _finish_story(
             "test": test,
         }, thread_id)
         state.save(STATE_PATH, data)
+    if not test:
+        try:
+            stats.record_play(tale_slug, variant_id, ending_scene, completed=True)
+        except Exception:
+            techlog.get().exception("stats record_play failed")
     await _say(bot, chat_id, phrases.end_line(adventure.title), thread_id=thread_id)
 
 
@@ -707,6 +719,7 @@ async def _open_scene_poll(
             return
         await _finish_story(
             bot, chat_id, adventure, tale_slug, variant_id,
+            ending_scene=scene.id,
             test=test, thread_id=thread_id)
         return
     if test:
@@ -896,6 +909,12 @@ async def _finish(
                 thread_id=thread_id)
 
     node = current["node"]
+    label = labels[index] if index < len(labels) else ""
+    if not test and label and label != phrases.BACK_LABEL:
+        try:
+            stats.record_choice(tale_slug, variant_id, node, label)
+        except Exception:
+            techlog.get().exception("stats record_choice failed")
     await _enter(
         bot, chat_id, adventure, dest,
         tale_slug=tale_slug,
@@ -918,6 +937,7 @@ async def _watch(bot: Bot) -> None:
 
 async def main() -> None:
     _load_env()
+    log = techlog.setup()
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("В .env нет TELEGRAM_BOT_TOKEN")
@@ -926,9 +946,11 @@ async def main() -> None:
     data = state.load(STATE_PATH)
     admin_token = state.ensure_admin_token(data, os.environ.get("ADMIN_TOKEN"))
     state.save(STATE_PATH, data)
-    print(f"Админ-токен тестового режима: {admin_token}", flush=True)
+    log.info("bot start; admin token ready")
+    print(f"Админ-токен (/admin и /test): {admin_token}", flush=True)
     bot = Bot(token)
     dp = Dispatcher()
+    dp.include_router(admin.router)
     dp.include_router(router)
     watcher = asyncio.create_task(_watch(bot))
     try:
@@ -936,3 +958,4 @@ async def main() -> None:
     finally:
         watcher.cancel()
         await bot.session.close()
+        log.info("bot stopped")
