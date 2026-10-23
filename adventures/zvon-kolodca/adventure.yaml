@@ -39,9 +39,24 @@ scenes:
     choices:
       - label: Спуститься по верёвке
         next: descend
+        fail: rope_slip
+        chance: [40, 70]
       - label: Отойти и искать священника
         next: priest
       - label: Пойти в трактир за советом
+        next: tavern
+
+  rope_slip:
+    text: |-
+      Верёвка скользит в мокрых ладонях. Вы успеваете вцепиться в камень
+      у самого края и выбраться обратно на площадь, ободравши ладони.
+      Звон смеётся над вами тонко, как над трусом. Сил на второй спуск
+      сейчас нет — только на разговор с живыми.
+    image: images/square_return.jpg
+    choices:
+      - label: К священнику
+        next: priest
+      - label: В трактир
         next: tavern
 
   priest:
@@ -83,9 +98,23 @@ scenes:
     choices:
       - label: Поверить Лире и спуститься с именем
         next: descend_named
+        fail: name_falters
+        chance: [35, 65]
       - label: Не верить — идти к священнику
         next: priest
       - label: Предложить Лире спуститься вместе
+        next: descend_with_lira
+
+  name_falters:
+    text: |-
+      Имя застревает в горле на середине. Вода отвечает глухим ударом,
+      и вы выныриваете у сруба, кашляя глиной. Лира смотрит без упрёка:
+      «Не ваше ещё. Возьмите крест — или меня. Одного шёпота мало.»
+    image: images/square_return.jpg
+    choices:
+      - label: К священнику за крестом
+        next: priest
+      - label: Спуститься с Лирой
         next: descend_with_lira
 
   smith:
@@ -105,10 +134,22 @@ scenes:
     choices:
       - label: Спуститься с именем и крестом
         next: descend_armed
+        fail: cross_lost
+        chance: [45, 80]
       - label: Спуститься только с именем
         next: descend_named
       - label: Отдать крест обратно и уйти из Устьева
         next: leave_coward
+
+  cross_lost:
+    text: |-
+      На спуске крест выскальзывает из пальцев и тонет без всплеска.
+      Имя ещё с вами — но без бронзы тень жмётся ближе. Приходится
+      идти так, будто креста никогда не было.
+    image: images/descend_named.jpg
+    choices:
+      - label: Произнести имя в темноте
+        next: descend_named
 
   look_with_cross:
     text: |-

@@ -56,6 +56,8 @@ scenes:
     choices:
       - label: Подкупить пачкой эдди и уверенностью
         next: solo_floor
+        fail: solo_floor_hard
+        chance: [40, 70]
       - label: Тихо вырубить и протащить через служебную
         next: solo_floor_hard
 
@@ -84,6 +86,8 @@ scenes:
     choices:
       - label: Отвлечь разговором и дать команде окно
         next: vault_solo_smooth
+        fail: vault_solo_loud
+        chance: [35, 65]
       - label: Разоружить быстро и жёстко
         next: vault_solo_loud
 
@@ -156,6 +160,8 @@ scenes:
     choices:
       - label: Вскрыть решётку и идти своим маршрутом
         next: tech_systems
+        fail: tech_trap
+        chance: [40, 75]
       - label: Проследить чужой шов до источника
         next: tech_trap
 
