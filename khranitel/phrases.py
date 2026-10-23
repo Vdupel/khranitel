@@ -50,6 +50,24 @@ WELCOME_PRIVATE = (
 BACK_LABEL = "↩ Назад"
 
 
+def skillcheck_admin_hint(scene_id: str, lines: list[str]) -> str:
+    """Текст только для /test: где в этой сцене спрятаны скиллчеки."""
+    body = "\n".join(f"• {line}" for line in lines)
+    return (
+        f"Админ /test — скиллчеки сцены «{scene_id}» "
+        f"(игрокам не видно):\n{body}"
+    )
+
+
+def skillcheck_admin_roll(label: str, outcome: str, detail: dict) -> str:
+    word = "успех" if outcome == "success" else "провал"
+    return (
+        f"Админ /test — скиллчек «{label}»: порог {detail['threshold']}% "
+        f"(диапазон {detail['chance_min']}–{detail['chance_max']}), "
+        f"d100 = {detail['roll']} → {word} → {detail['dest']}"
+    )
+
+
 def pick(options: tuple[str, ...] | list[str]) -> str:
     return random.choice(list(options))
 

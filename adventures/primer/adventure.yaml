@@ -10,6 +10,8 @@ scenes:
     choices:
       - label: Свернуть в лес
         next: forest
+        fail: forest_lost
+        chance: [45, 75]
       - label: Идти к огням деревни
         next: village
       - label: Ждать у костра
@@ -22,8 +24,16 @@ scenes:
     choices:
       - label: Заговорить
         next: talk
+        fail: talk_snarl
+        chance: [35, 65]
       - label: Обойти лесом
         next: around
+  forest_lost:
+    text: |-
+      Чаща смыкается раньше, чем вы замечаете. К утру тропа выводит
+      не к волку — к опушке у деревни, а перчатка так и осталась у дуба.
+    image: images/around.jpg
+    choices: []
   village:
     text: |-
       В деревне не спят. На площади рыцарь без перчатки ищет того,
@@ -38,13 +48,28 @@ scenes:
     choices:
       - label: Проводить в деревню
         next: village
+        fail: camp_parting
+        chance: [40, 70]
       - label: Отказаться и уйти в лес
         next: forest
+  camp_parting:
+    text: |-
+      По дороге рыцарь замолкает и сворачивает один. «Дальше мне
+      нельзя с проводником,» — бросает он. Вы доходите до огней вдвоём
+      с собственной тенью; за столом вас ждут без него.
+    image: images/village.jpg
+    choices: []
   talk:
     text: |-
       Волк говорит человеческим голосом: перчатку украли не вы.
       Он провожает вас до опушки и исчезает, оставив её у ног.
     image: images/talk.jpg
+    choices: []
+  talk_snarl:
+    text: |-
+      Волк рычит — не словами. Вы пятитесь, спотыкаетесь, и лес
+      сам выталкивает вас к деревенской дороге. Перчатка остаётся у него.
+    image: images/around.jpg
     choices: []
   around:
     text: |-

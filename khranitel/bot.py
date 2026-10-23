@@ -12,8 +12,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile, Message, PollAnswer
 
-from khranitel.engine import decide, verdict
-from khranitel.format import Adventure, AdventureError, Scene, install_upload
+from khranitel.engine import decide, roll_check, verdict
+from khranitel.format import Adventure, AdventureError, Choice, Scene, install_upload
 from khranitel import phrases, state, tales
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -297,7 +297,7 @@ async def test_command(message: Message, command: CommandObject) -> None:
         return
     await message.answer(
         "Тестовый режим. Дальше /begin — сказ с пунктом «назад» в опросах, "
-        "ответ сразу после голоса.")
+        "ответ сразу после голоса. Здесь же видны скрытые скиллчеки сцен.")
     await _open_begin_vote(message.bot, message.chat.id, instant=True, test=True)
 
 
@@ -495,9 +495,17 @@ async def _enter(
     if len(choices) == 1 and not (test and path):
         only = choices[0]
         await bot.send_message(chat_id, f"Другого пути нет: «{only.label}».")
+        dest = only.next
+        if only.is_check:
+            dest, outcome, detail = roll_check(
+                only.chance_min, only.chance_max,
+                success=only.next, fail=only.fail)
+            if test:
+                await bot.send_message(
+                    chat_id, phrases.skillcheck_admin_roll(only.label, outcome, detail))
         chain.add(scene_id)
         await _enter(
-            bot, chat_id, adventure, only.next,
+            bot, chat_id, adventure, dest,
             tale_slug=tale_slug,
             variant_id=variant_id,
             instant=instant,
@@ -557,6 +565,17 @@ async def _show_scene(bot: Bot, chat_id: int, adventure: Adventure, scene: Scene
     await bot.send_message(chat_id, text)
 
 
+def _check_payload(choice: Choice) -> dict | None:
+    if not choice.is_check:
+        return None
+    return {
+        "chance_min": choice.chance_min,
+        "chance_max": choice.chance_max,
+        "success": choice.next,
+        "fail": choice.fail,
+    }
+
+
 async def _open_scene_poll(
     bot: Bot,
     chat_id: int,
@@ -571,9 +590,11 @@ async def _open_scene_poll(
 ) -> None:
     labels = [choice.label for choice in scene.choices]
     nexts = [choice.next for choice in scene.choices]
+    checks: list[dict | None] = [_check_payload(choice) for choice in scene.choices]
     if test and path and len(labels) < 10:
         labels = labels + [phrases.BACK_LABEL]
         nexts = nexts + [BACK_NEXT]
+        checks = checks + [None]
     if len(labels) < 2:
         # только «назад» на финале теста — всё равно опрос из одного пункта недопустим
         if labels:
@@ -591,6 +612,17 @@ async def _open_scene_poll(
             return
         await _finish_story(bot, chat_id, adventure, tale_slug, variant_id, test=test)
         return
+    if test:
+        hint_lines = []
+        for choice in scene.choices:
+            if not choice.is_check:
+                continue
+            hint_lines.append(
+                f"«{choice.label}» — шанс {choice.chance_min}–{choice.chance_max}% "
+                f"→ {choice.next} / провал → {choice.fail}")
+        if hint_lines:
+            await bot.send_message(
+                chat_id, phrases.skillcheck_admin_hint(scene.id, hint_lines))
     poll = await bot.send_poll(
         chat_id, POLL_QUESTION, labels, is_anonymous=not instant)
     deadline = (
@@ -612,6 +644,7 @@ async def _open_scene_poll(
             "deadline": deadline,
             "labels": labels,
             "next": nexts,
+            "checks": checks,
             "path": list(path),
         })
         state.save(STATE_PATH, data)
@@ -731,9 +764,24 @@ async def _finish(
         )
         return
 
+    checks = list(current.get("checks") or [])
+    check = checks[index] if index < len(checks) else None
+    dest = chosen
+    if isinstance(check, dict):
+        dest, outcome, detail = roll_check(
+            int(check["chance_min"]),
+            int(check["chance_max"]),
+            success=str(check["success"]),
+            fail=str(check["fail"]),
+        )
+        if test:
+            label = labels[index] if index < len(labels) else chosen
+            await bot.send_message(
+                chat_id, phrases.skillcheck_admin_roll(label, outcome, detail))
+
     node = current["node"]
     await _enter(
-        bot, chat_id, adventure, chosen,
+        bot, chat_id, adventure, dest,
         tale_slug=tale_slug,
         variant_id=variant_id,
         instant=instant,
