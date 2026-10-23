@@ -45,12 +45,16 @@ def load(path: Path) -> dict:
     token = raw.get("admin_token")
     if not isinstance(token, str) or not token.strip():
         token = None
+    admin_sessions = raw.get("admin_sessions")
+    if not isinstance(admin_sessions, dict):
+        admin_sessions = {}
     return {
         "chats": chats,
         "cooldowns": cooldowns,
         "last_finished": last_finished,
         "welcomed": [int(x) for x in welcomed if str(x).lstrip("-").isdigit()],
         "admin_token": token,
+        "admin_sessions": admin_sessions,
     }
 
 
@@ -68,6 +72,7 @@ def _empty() -> dict:
         "last_finished": {},
         "welcomed": [],
         "admin_token": None,
+        "admin_sessions": {},
     }
 
 
