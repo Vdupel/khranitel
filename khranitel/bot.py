@@ -1,4 +1,4 @@
-"""Телеграм-бот. Сценарий, опрос, по окончании срока — последствия и следующий опрос."""
+"""Телеграм-бот. Сказ в чате и в личке, версии историй, тест с «назад»."""
 
 from __future__ import annotations
 
@@ -10,17 +10,20 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, Message, PollAnswer
 
 from khranitel.engine import decide, verdict
-from khranitel.format import (
-    Adventure, AdventureError, Scene, install_upload, list_adventures, load_adventure)
-from khranitel import state
+from khranitel.format import Adventure, AdventureError, Scene, install_upload
+from khranitel import phrases, state, tales
 
 ROOT = Path(__file__).resolve().parents[1]
 ADVENTURES = ROOT / "adventures"
 STATE_PATH = ROOT / "data" / "state.json"
 POLL_QUESTION = "Что делаем?"
+BEGIN_VOTE_MINUTES = 5
+SPOILER_VOTE_MINUTES = 5
+INSTANT_DEADLINE_PAD = 365 * 24 * 3600
+BACK_NEXT = "__back__"
 router = Router()
 _lock = asyncio.Lock()
 
@@ -40,6 +43,14 @@ def _is_admin(message: Message) -> bool:
     return user is not None and user.id in _admins()
 
 
+def _is_private(message: Message) -> bool:
+    return message.chat.type == "private"
+
+
+def _is_group(message: Message) -> bool:
+    return message.chat.type in {"group", "supergroup"}
+
+
 def _load_env() -> None:
     path = ROOT / ".env"
     if not path.is_file():
@@ -56,77 +67,135 @@ async def _deny(message: Message) -> None:
     await message.answer("Это может только ведущий. Его id записан в ADMIN_IDS.")
 
 
-@router.message(Command("start", "help"))
+async def _maybe_welcome(message: Message) -> None:
+    if not _is_private(message) or message.from_user is None:
+        return
+    async with _lock:
+        data = state.load(STATE_PATH)
+        first = state.mark_welcomed(data, message.from_user.id)
+        if first:
+            state.save(STATE_PATH, data)
+    if first:
+        await message.answer(phrases.WELCOME_PRIVATE)
+
+
+@router.message(Command("start"))
+async def start_command(message: Message) -> None:
+    if _is_private(message):
+        async with _lock:
+            data = state.load(STATE_PATH)
+            if message.from_user is not None:
+                state.mark_welcomed(data, message.from_user.id)
+                state.save(STATE_PATH, data)
+        await message.answer(phrases.WELCOME_PRIVATE)
+        await message.answer(phrases.help_text(private=True, group=False))
+        return
+    await message.answer(phrases.help_text(private=False, group=True))
+
+
+@router.message(Command("help"))
 async def help_command(message: Message) -> None:
+    await _maybe_welcome(message)
     await message.answer(
-        "Хранитель приключений ведёт общее приключение в чате.\n"
-        "Ведущий запускает сценарий — бот показывает сцену и открывает голосование.\n"
-        "Когда время выходит, бот пишет, какой путь взяло большинство, "
-        "описание последствий, картинку и следующее голосование.\n\n"
-        "/adventures — какие сценарии уже лежат у бота\n"
-        "/begin имя — начать в этом чате\n"
-        "/status — что идёт сейчас\n"
-        "/stop — прервать\n\n"
-        "Новый сценарий ведущий присылает боту в личку: файл adventure.yaml "
-        "или zip с adventure.yaml и картинками. Свой сценарий собирает "
-        "генератор: python -m generator")
+        phrases.help_text(private=_is_private(message), group=_is_group(message)))
 
 
 @router.message(Command("adventures"))
 async def adventures_command(message: Message) -> None:
+    await _maybe_welcome(message)
     try:
-        items = list_adventures(ADVENTURES)
+        items = tales.discover_tales(ADVENTURES)
     except AdventureError as error:
         await message.answer("Сценарий повреждён:\n" + "\n".join(error.errors))
         return
     if not items:
-        await message.answer("Сценариев пока нет. Пришлите yaml или zip в личку бота.")
+        await message.answer("Историй пока нет. Пришлите yaml или zip в личку бота.")
         return
-    lines = [f"• {item.slug} — {item.title} ({item.vote_minutes} мин.)" for item in items]
-    await message.answer("Сценарии:\n" + "\n".join(lines))
+    lines = []
+    for item in items:
+        versions = ", ".join(item.variant_ids())
+        lines.append(f"• {item.slug} — {item.title} (версии: {versions})")
+    await message.answer("Истории:\n" + "\n".join(lines))
 
 
 @router.message(Command("begin"))
 async def begin_command(message: Message, command: CommandObject) -> None:
-    if not _is_admin(message):
+    await _maybe_welcome(message)
+    if _is_group(message) and not _is_admin(message):
         await _deny(message)
         return
     slug = (command.args or "").strip()
-    if not slug:
-        await adventures_command(message)
-        return
-    folder = ADVENTURES / slug
-    try:
-        adventure = load_adventure(folder)
-    except AdventureError as error:
-        await message.answer("Не запускаю:\n" + "\n".join(error.errors))
-        return
     async with _lock:
         data = state.load(STATE_PATH)
         if state.session(data, message.chat.id):
-            await message.answer("В этом чате уже идёт приключение. /stop — прервать.")
+            await message.answer("В этом чате уже идёт сказ. /stop — оборвать.")
             return
-    await message.answer(f"Начинаем «{adventure.title}». На голосование — {adventure.vote_minutes} мин.")
-    await _enter(message.bot, message.chat.id, adventure, adventure.start)
+    if slug:
+        await _start_tale(message.bot, message.chat.id, slug, instant=_is_private(message))
+        return
+    await _open_begin_vote(message.bot, message.chat.id, instant=_is_private(message))
+
+
+@router.message(Command("retell"))
+async def retell_command(message: Message) -> None:
+    await _maybe_welcome(message)
+    async with _lock:
+        data = state.load(STATE_PATH)
+        if state.session(data, message.chat.id):
+            await message.answer("Сначала дослушайте или /stop — иначе два сказа сразу.")
+            return
+        finished = state.last_finished(data, message.chat.id)
+    if not finished:
+        await message.answer("Ещё нечего пересказывать — ни одна история здесь не закончилась.")
+        return
+    await _start_tale(
+        message.bot,
+        message.chat.id,
+        finished["tale"],
+        variant=finished.get("variant"),
+        instant=_is_private(message) or bool(finished.get("test")),
+        test=bool(finished.get("test")),
+    )
 
 
 @router.message(Command("status"))
 async def status_command(message: Message) -> None:
+    await _maybe_welcome(message)
     data = state.load(STATE_PATH)
     current = state.session(data, message.chat.id)
     if not current:
-        await message.answer("В этом чате приключение не идёт.")
+        await message.answer("В этом чате сказ не идёт.")
+        return
+    kind = current.get("kind", "scene")
+    if kind == "begin":
+        left = max(0, int(current["deadline"] - time.time()))
+        minutes, seconds = divmod(left, 60)
+        await message.answer(
+            f"Выбираем историю. До конца голосования {minutes} мин. {seconds} сек.")
+        return
+    if kind == "spoiler":
+        left = max(0, int(current["deadline"] - time.time()))
+        minutes, seconds = divmod(left, 60)
+        await message.answer(
+            f"Голосуем за другую версию «{current.get('tale_title', current.get('title', ''))}». "
+            f"Осталось {minutes} мин. {seconds} сек.")
+        return
+    title = current.get("title", "?")
+    node = current.get("node", "?")
+    if current.get("instant"):
+        await message.answer(f"«{title}», сцена {node}. Жду ваш голос — отвечу сразу.")
         return
     left = max(0, int(current["deadline"] - time.time()))
     minutes, seconds = divmod(left, 60)
     await message.answer(
-        f"«{current['title']}», сцена {current['node']}. "
+        f"«{title}», сцена {node}. "
         f"До конца голосования {minutes} мин. {seconds} сек.")
 
 
 @router.message(Command("stop"))
 async def stop_command(message: Message) -> None:
-    if not _is_admin(message):
+    await _maybe_welcome(message)
+    if _is_group(message) and not _is_admin(message):
         await _deny(message)
         return
     async with _lock:
@@ -136,14 +205,105 @@ async def stop_command(message: Message) -> None:
             state.put(data, message.chat.id, None)
             state.save(STATE_PATH, data)
     if not current:
-        await message.answer("Останавливать нечего.")
+        await message.answer("Останавливать нечего — и так тихо.")
         return
-    await message.answer("Приключение остановлено. Голосование в чате можно закрыть вручную.")
+    await message.answer(phrases.stop_lament())
+
+
+@router.message(Command("spoiler"))
+async def spoiler_command(message: Message) -> None:
+    if not _is_group(message):
+        return
+    async with _lock:
+        data = state.load(STATE_PATH)
+        current = state.session(data, message.chat.id)
+        finished = state.last_finished(data, message.chat.id)
+    tale_slug = None
+    variant = None
+    if current and current.get("kind") == "scene":
+        tale_slug = current.get("tale")
+        variant = current.get("variant")
+    elif finished:
+        tale_slug = finished.get("tale")
+        variant = finished.get("variant")
+    if not tale_slug:
+        await message.answer("Нечего спасать от спойлеров — сказ сейчас не идёт и недавно не кончался.")
+        return
+    tale = tales.tale_by_slug(ADVENTURES, tale_slug)
+    if tale is None:
+        await message.answer("Свиток этой истории утерян.")
+        return
+    others = tales.other_variants(tale, variant or "")
+    if not others:
+        await message.answer(
+            f"У «{tale.title}» пока одна версия. Сказитель ещё не положил другую.")
+        return
+    if current:
+        async with _lock:
+            data = state.load(STATE_PATH)
+            state.put(data, message.chat.id, None)
+            state.save(STATE_PATH, data)
+    labels = []
+    nexts = []
+    for vid in others:
+        try:
+            adv = tale.load(vid)
+            labels.append(f"{adv.title} [{vid}]"[:100])
+        except AdventureError:
+            labels.append(vid[:100])
+        nexts.append(vid)
+    labels.append("Оставить как есть")
+    nexts.append("__keep__")
+    prompt = phrases.spoiler_prompt(tale.title)
+    await message.answer(prompt)
+    poll = await message.bot.send_poll(
+        message.chat.id, "Другая версия?", labels, is_anonymous=True)
+    async with _lock:
+        data = state.load(STATE_PATH)
+        state.put(data, message.chat.id, {
+            "kind": "spoiler",
+            "instant": False,
+            "test": False,
+            "tale": tale.slug,
+            "variant": variant,
+            "tale_title": tale.title,
+            "title": tale.title,
+            "message_id": poll.message_id,
+            "poll_id": poll.poll.id if poll.poll else "",
+            "deadline": time.time() + SPOILER_VOTE_MINUTES * 60,
+            "labels": labels,
+            "next": nexts,
+            "path": [],
+        })
+        state.save(STATE_PATH, data)
+
+
+@router.message(Command("test"))
+async def test_command(message: Message, command: CommandObject) -> None:
+    if not _is_private(message):
+        return
+    await _maybe_welcome(message)
+    token = (command.args or "").strip()
+    async with _lock:
+        data = state.load(STATE_PATH)
+        expected = state.ensure_admin_token(
+            data, os.environ.get("ADMIN_TOKEN"))
+        state.save(STATE_PATH, data)
+    if not token or token != expected:
+        await message.answer("Нужен верный админ-токен: /test <токен>")
+        return
+    if state.session(state.load(STATE_PATH), message.chat.id):
+        await message.answer("Сначала /stop — тест не наслаивается на текущий сказ.")
+        return
+    await message.answer(
+        "Тестовый режим. Дальше /begin — сказ с пунктом «назад» в опросах, "
+        "ответ сразу после голоса.")
+    await _open_begin_vote(message.bot, message.chat.id, instant=True, test=True)
 
 
 @router.message(F.document)
 async def upload(message: Message) -> None:
-    if message.chat.type != "private":
+    if not _is_private(message):
         return
     if not _is_admin(message):
         await _deny(message)
@@ -170,8 +330,38 @@ async def upload(message: Message) -> None:
         await message.answer("Не принял сценарий:\n" + text)
         return
     await message.answer(
-        f"Сценарий «{adventure.title}» сохранён как {slug}. "
-        f"В чате сообщества: /begin {slug}")
+        f"История «{adventure.title}» сохранена как {slug} (версия default). "
+        f"Другие версии сказитель кладёт в adventures/{slug}/variants/<id>/.")
+
+
+@router.message(F.chat.type == "private")
+async def private_fallback(message: Message) -> None:
+    """Любое иное личное сообщение — велком один раз, иначе подсказка."""
+    if message.text and message.text.startswith("/"):
+        return
+    await _maybe_welcome(message)
+
+
+@router.poll_answer()
+async def on_poll_answer(answer: PollAnswer, bot: Bot) -> None:
+    """Мгновенный режим: первый голос закрывает опрос."""
+    poll_id = answer.poll_id
+    async with _lock:
+        data = state.load(STATE_PATH)
+        found = None
+        for key, current in data["chats"].items():
+            if isinstance(current, dict) and current.get("poll_id") == poll_id:
+                found = (int(key), current)
+                break
+        if found is None:
+            return
+        chat_id, current = found
+        if not current.get("instant"):
+            return
+        # забираем сессию, чтобы второй голос не обработался
+        state.put(data, chat_id, None)
+        state.save(STATE_PATH, data)
+    await _finish(bot, chat_id, current, prefetched_option=answer.option_ids)
 
 
 def _slug(filename: str) -> str:
@@ -180,28 +370,178 @@ def _slug(filename: str) -> str:
     return (slug or "adventure")[:64]
 
 
-async def _enter(bot: Bot, chat_id: int, adventure: Adventure, scene_id: str,
-                 *, chain: set[str] | None = None) -> None:
+async def _open_begin_vote(
+    bot: Bot, chat_id: int, *, instant: bool, test: bool = False,
+) -> None:
+    catalog = tales.discover_tales(ADVENTURES)
+    if not catalog:
+        await bot.send_message(chat_id, "Историй нет. Сказитель ещё не положил свитки.")
+        return
+    async with _lock:
+        data = state.load(STATE_PATH)
+        cool = state.chat_cooldowns(data, chat_id)
+        # tick после предыдущего begin — кулдаун «на это и следующее»
+        # уменьшаем при открытии нового голосования begin
+        candidates = tales.pick_candidates(catalog, cool)
+        state.save(STATE_PATH, data)
+    if not candidates:
+        await bot.send_message(chat_id, "Не из чего выбирать.")
+        return
+    if len(candidates) == 1:
+        only = candidates[0]
+        async with _lock:
+            data = state.load(STATE_PATH)
+            cool = state.chat_cooldowns(data, chat_id)
+            tales.tick_cooldowns(cool)
+            state.save(STATE_PATH, data)
+        await bot.send_message(
+            chat_id, f"На кону одна история — «{only.title}». Иного свитка нет.")
+        await _start_tale(bot, chat_id, only.slug, instant=instant, test=test)
+        return
+    labels = [f"{tale.title}"[:100] for tale in candidates]
+    nexts = [tale.slug for tale in candidates]
+    await bot.send_message(chat_id, phrases.begin_prompt())
+    poll = await bot.send_poll(
+        chat_id,
+        "Какую историю слушаем?",
+        labels,
+        is_anonymous=not instant,
+    )
+    deadline = (
+        time.time() + INSTANT_DEADLINE_PAD if instant
+        else time.time() + BEGIN_VOTE_MINUTES * 60)
+    async with _lock:
+        data = state.load(STATE_PATH)
+        cool = state.chat_cooldowns(data, chat_id)
+        tales.tick_cooldowns(cool)
+        state.put(data, chat_id, {
+            "kind": "begin",
+            "instant": instant,
+            "test": test,
+            "message_id": poll.message_id,
+            "poll_id": poll.poll.id if poll.poll else "",
+            "deadline": deadline,
+            "labels": labels,
+            "next": nexts,
+            "path": [],
+        })
+        state.save(STATE_PATH, data)
+
+
+async def _start_tale(
+    bot: Bot,
+    chat_id: int,
+    tale_slug: str,
+    *,
+    variant: str | None = None,
+    instant: bool = False,
+    test: bool = False,
+) -> None:
+    tale = tales.tale_by_slug(ADVENTURES, tale_slug)
+    if tale is None:
+        await bot.send_message(chat_id, f"Истории «{tale_slug}» нет.")
+        return
+    try:
+        variant_id = variant if variant in tale.variants else tales.pick_variant(tale)
+        adventure = tale.load(variant_id)
+    except AdventureError as error:
+        await bot.send_message(chat_id, "Не запускаю:\n" + "\n".join(error.errors))
+        return
+    except KeyError:
+        await bot.send_message(chat_id, "Версия истории не найдена.")
+        return
+    await bot.send_message(chat_id, phrases.start_line(adventure.title))
+    await _enter(
+        bot, chat_id, adventure,
+        adventure.start,
+        tale_slug=tale.slug,
+        variant_id=variant_id,
+        instant=instant,
+        test=test,
+        path=[],
+    )
+
+
+async def _enter(
+    bot: Bot,
+    chat_id: int,
+    adventure: Adventure,
+    scene_id: str,
+    *,
+    tale_slug: str,
+    variant_id: str,
+    instant: bool,
+    test: bool,
+    path: list[str],
+    chain: set[str] | None = None,
+) -> None:
     chain = set() if chain is None else chain
     if scene_id in chain:
         await bot.send_message(chat_id, "Сценарий зациклился без выбора. Останавливаюсь.")
         return
     scene = adventure.scene(scene_id)
     await _show_scene(bot, chat_id, adventure, scene, scene.text)
-    if len(scene.choices) >= 2:
-        await _open_poll(bot, chat_id, adventure, scene)
+    choices = list(scene.choices)
+    if len(choices) >= 2 or (test and path and len(choices) >= 1):
+        await _open_scene_poll(
+            bot, chat_id, adventure, scene,
+            tale_slug=tale_slug,
+            variant_id=variant_id,
+            instant=instant,
+            test=test,
+            path=path,
+        )
         return
-    if len(scene.choices) == 1:
-        only = scene.choices[0]
+    if len(choices) == 1 and not (test and path):
+        only = choices[0]
         await bot.send_message(chat_id, f"Другого пути нет: «{only.label}».")
         chain.add(scene_id)
-        await _enter(bot, chat_id, adventure, only.next, chain=chain)
+        await _enter(
+            bot, chat_id, adventure, only.next,
+            tale_slug=tale_slug,
+            variant_id=variant_id,
+            instant=instant,
+            test=test,
+            path=path + [scene_id],
+            chain=chain,
+        )
         return
+    if test and path and len(choices) == 0:
+        # финал в тесте — всё же дать «назад»
+        await _open_scene_poll(
+            bot, chat_id, adventure, scene,
+            tale_slug=tale_slug,
+            variant_id=variant_id,
+            instant=instant,
+            test=test,
+            path=path,
+        )
+        return
+    await _finish_story(bot, chat_id, adventure, tale_slug, variant_id, test=test)
+
+
+async def _finish_story(
+    bot: Bot,
+    chat_id: int,
+    adventure: Adventure,
+    tale_slug: str,
+    variant_id: str,
+    *,
+    test: bool,
+) -> None:
     async with _lock:
         data = state.load(STATE_PATH)
         state.put(data, chat_id, None)
+        cool = state.chat_cooldowns(data, chat_id)
+        tales.mark_played(cool, tale_slug)
+        state.set_last_finished(data, chat_id, {
+            "tale": tale_slug,
+            "variant": variant_id,
+            "title": adventure.title,
+            "test": test,
+        })
         state.save(STATE_PATH, data)
-    await bot.send_message(chat_id, f"«{adventure.title}» закончилось.")
+    await bot.send_message(chat_id, phrases.end_line(adventure.title))
 
 
 async def _show_scene(bot: Bot, chat_id: int, adventure: Adventure, scene: Scene, text: str) -> None:
@@ -217,31 +557,78 @@ async def _show_scene(bot: Bot, chat_id: int, adventure: Adventure, scene: Scene
     await bot.send_message(chat_id, text)
 
 
-async def _open_poll(bot: Bot, chat_id: int, adventure: Adventure, scene: Scene) -> None:
+async def _open_scene_poll(
+    bot: Bot,
+    chat_id: int,
+    adventure: Adventure,
+    scene: Scene,
+    *,
+    tale_slug: str,
+    variant_id: str,
+    instant: bool,
+    test: bool,
+    path: list[str],
+) -> None:
     labels = [choice.label for choice in scene.choices]
-    poll = await bot.send_poll(chat_id, POLL_QUESTION, labels, is_anonymous=True)
+    nexts = [choice.next for choice in scene.choices]
+    if test and path and len(labels) < 10:
+        labels = labels + [phrases.BACK_LABEL]
+        nexts = nexts + [BACK_NEXT]
+    if len(labels) < 2:
+        # только «назад» на финале теста — всё равно опрос из одного пункта недопустим
+        if labels:
+            await bot.send_message(chat_id, f"Можно только: «{labels[0]}».")
+            if nexts[0] == BACK_NEXT:
+                prev = path[-1]
+                await _enter(
+                    bot, chat_id, adventure, prev,
+                    tale_slug=tale_slug,
+                    variant_id=variant_id,
+                    instant=instant,
+                    test=test,
+                    path=path[:-1],
+                )
+            return
+        await _finish_story(bot, chat_id, adventure, tale_slug, variant_id, test=test)
+        return
+    poll = await bot.send_poll(
+        chat_id, POLL_QUESTION, labels, is_anonymous=not instant)
+    deadline = (
+        time.time() + INSTANT_DEADLINE_PAD if instant
+        else time.time() + adventure.vote_minutes * 60)
     async with _lock:
         data = state.load(STATE_PATH)
         state.put(data, chat_id, {
+            "kind": "scene",
+            "instant": instant,
+            "test": test,
+            "tale": tale_slug,
+            "variant": variant_id,
             "adventure": adventure.slug,
             "title": adventure.title,
             "node": scene.id,
             "message_id": poll.message_id,
-            "deadline": time.time() + adventure.vote_minutes * 60,
+            "poll_id": poll.poll.id if poll.poll else "",
+            "deadline": deadline,
             "labels": labels,
-            "next": [choice.next for choice in scene.choices],
+            "next": nexts,
+            "path": list(path),
         })
         state.save(STATE_PATH, data)
 
 
 async def close_due(bot: Bot) -> None:
-    """Закрыть голосования, у которых вышло время."""
+    """Закрыть голосования, у которых вышло время (групповой режим)."""
     async with _lock:
         data = state.load(STATE_PATH)
         due = []
         now = time.time()
         for key, current in list(data["chats"].items()):
-            if isinstance(current, dict) and now >= float(current.get("deadline", 0)):
+            if not isinstance(current, dict):
+                continue
+            if current.get("instant"):
+                continue
+            if now >= float(current.get("deadline", 0)):
                 due.append((int(key), current))
                 state.put(data, int(key), None)
         if due:
@@ -250,23 +637,109 @@ async def close_due(bot: Bot) -> None:
         await _finish(bot, chat_id, current)
 
 
-async def _finish(bot: Bot, chat_id: int, current: dict) -> None:
+async def _finish(
+    bot: Bot,
+    chat_id: int,
+    current: dict,
+    *,
+    prefetched_option: list[int] | None = None,
+) -> None:
+    kind = current.get("kind", "scene")
     try:
-        adventure = load_adventure(ADVENTURES / current["adventure"])
-        closed = await bot.stop_poll(chat_id, int(current["message_id"]))
-    except Exception as error:
+        if prefetched_option is not None:
+            # мгновенный режим: голос уже известен, опрос закрываем для порядка
+            try:
+                await bot.stop_poll(chat_id, int(current["message_id"]))
+            except Exception:
+                pass
+            if not prefetched_option:
+                index = 0
+            else:
+                index = int(prefetched_option[0])
+            labels = list(current["labels"])
+            if index < 0 or index >= len(labels):
+                await bot.send_message(chat_id, "Голос не из этого опроса. Сказ остановлен.")
+                return
+            counts = [0] * len(labels)
+            counts[index] = 1
+        else:
+            closed = await bot.stop_poll(chat_id, int(current["message_id"]))
+            counts = [option.voter_count for option in closed.options]
+            labels = list(current["labels"])
+            if len(counts) != len(labels):
+                await bot.send_message(chat_id, "Опрос не совпал со сценарием. Сказ остановлен.")
+                return
+            index, _reason = decide(counts)
+            if not current.get("instant"):
+                await bot.send_message(chat_id, verdict(labels, counts))
+    except Exception:
+        await bot.send_message(
+            chat_id, "Не удалось закрыть голосование. Сказ остановлен.")
+        return
+
+    chosen = current["next"][index]
+
+    if kind == "begin":
+        await _start_tale(
+            bot, chat_id, chosen,
+            instant=bool(current.get("instant")),
+            test=bool(current.get("test")),
+        )
+        return
+
+    if kind == "spoiler":
+        if chosen == "__keep__":
+            await bot.send_message(chat_id, "Оставляем текущую версию. Спойлеры — ваша ноша.")
+            return
+        await _start_tale(
+            bot, chat_id, current["tale"],
+            variant=chosen,
+            instant=False,
+            test=False,
+        )
+        return
+
+    # scene
+    tale_slug = current["tale"]
+    variant_id = current["variant"]
+    path = list(current.get("path") or [])
+    instant = bool(current.get("instant"))
+    test = bool(current.get("test"))
+    try:
+        tale = tales.tale_by_slug(ADVENTURES, tale_slug)
+        if tale is None:
+            raise AdventureError(["история исчезла"])
+        adventure = tale.load(variant_id)
+    except AdventureError as error:
         details = getattr(error, "errors", None)
-        text = "\n".join(details) if details else "Не удалось закрыть голосование. Приключение остановлено."
+        text = "\n".join(details) if details else str(error)
         await bot.send_message(chat_id, text)
         return
-    counts = [option.voter_count for option in closed.options]
-    labels = list(current["labels"])
-    if len(counts) != len(labels):
-        await bot.send_message(chat_id, "Опрос не совпал со сценарием. Приключение остановлено.")
+
+    if chosen == BACK_NEXT:
+        if not path:
+            await bot.send_message(chat_id, "Назад уже некуда.")
+            return
+        prev = path[-1]
+        await _enter(
+            bot, chat_id, adventure, prev,
+            tale_slug=tale_slug,
+            variant_id=variant_id,
+            instant=instant,
+            test=test,
+            path=path[:-1],
+        )
         return
-    index, _reason = decide(counts)
-    await bot.send_message(chat_id, verdict(labels, counts))
-    await _enter(bot, chat_id, adventure, current["next"][index])
+
+    node = current["node"]
+    await _enter(
+        bot, chat_id, adventure, chosen,
+        tale_slug=tale_slug,
+        variant_id=variant_id,
+        instant=instant,
+        test=test,
+        path=path + [node],
+    )
 
 
 async def _watch(bot: Bot) -> None:
@@ -285,6 +758,10 @@ async def main() -> None:
         raise SystemExit("В .env нет TELEGRAM_BOT_TOKEN")
     if not _admins():
         raise SystemExit("В .env нет ADMIN_IDS")
+    data = state.load(STATE_PATH)
+    admin_token = state.ensure_admin_token(data, os.environ.get("ADMIN_TOKEN"))
+    state.save(STATE_PATH, data)
+    print(f"Админ-токен тестового режима: {admin_token}", flush=True)
     bot = Bot(token)
     dp = Dispatcher()
     dp.include_router(router)
